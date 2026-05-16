@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from backend.api.deps import verify_api_key
 from backend.api.schemas import (
-    CancelOrderResponse, OrderListSchema,
+    CancelOrderResponse, OrderListSchema, OrderType,
     PlaceOrderRequest, OrderSchema,
 )
 from backend.api.state import app_state
@@ -40,7 +40,7 @@ async def place_order(request: PlaceOrderRequest):
         order_id=order.order_id,
         symbol=order.symbol,
         side=request.side,
-        order_type=request.side if request.price else request.side,
+        order_type=OrderType.LIMIT if request.price else OrderType.MARKET,
         quantity=order.quantity,
         price=order.price,
         status=order.status.value,
