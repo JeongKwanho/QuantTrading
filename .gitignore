@@ -14,6 +14,12 @@ env/
 dist/
 build/
 
+# Claude Code memory (local only)
+.claude/
+
+# Temp chart output
+tools/*.html
+
 # IDE
 .vscode/
 .idea/
