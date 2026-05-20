@@ -44,11 +44,15 @@ class MockBroker(BaseBroker):
         initial_balance: float = 10000.0,
         leverage: int = 1,
         slippage: float = 0.0,
+        taker_fee: float = TAKER_FEE,
+        maker_fee: float = MAKER_FEE,
     ) -> None:
         super().__init__()
         self._initial_balance = initial_balance
         self._leverage = leverage
-        self._slippage = slippage          # 체결 슬리피지 비율 (예: 0.001 = 0.1%)
+        self._slippage = slippage
+        self._taker_fee = taker_fee
+        self._maker_fee = maker_fee
 
         self._balance: float = initial_balance
         self._positions: dict[str, _MockPosition] = {}
@@ -165,12 +169,12 @@ class MockBroker(BaseBroker):
     # ── 성과 조회 ─────────────────────────────────────────────────────────
 
     def get_total_equity(self) -> float:
-        """현재 총 자산 = 잔고 + 미실현 손익."""
-        upnl = sum(
-            self._calc_upnl(p, self._current_prices.get(p.symbol, p.entry_price))
-            for p in self._positions.values()
-        )
-        return self._balance + upnl
+        """현재 총 자산 = 잔고 + 증거금 + 미실현 손익."""
+        total = self._balance
+        for p in self._positions.values():
+            current = self._current_prices.get(p.symbol, p.entry_price)
+            total += p.margin + self._calc_upnl(p, current)
+        return total
 
     def get_fills(self) -> list[Fill]:
         return list(self._fills)
@@ -186,7 +190,7 @@ class MockBroker(BaseBroker):
     # ── 내부 계산 ─────────────────────────────────────────────────────────
 
     def _execute_fill(self, order: Order, fill_price: float) -> None:
-        fee_rate = TAKER_FEE if order.order_type == OrderType.MARKET else MAKER_FEE
+        fee_rate = self._taker_fee if order.order_type == OrderType.MARKET else self._maker_fee
         fee = fill_price * order.quantity * fee_rate
         notional = fill_price * order.quantity
         margin = notional / self._leverage
