@@ -195,17 +195,19 @@ class MockBroker(BaseBroker):
         notional = fill_price * order.quantity
         margin = notional / self._leverage
 
-        # 잔고 차감 (수수료 포함)
-        if order.side == OrderSide.BUY:
+        existing = self._positions.get(order.symbol)
+
+        if existing is not None and existing.side != order.side:
+            # 반대 포지션 → 청산
+            self._close_position(order, fill_price, fee)
+        else:
+            # 신규 포지션 열기 (롱 BUY or 숏 SELL)
             cost = margin + fee
             if cost > self._balance:
                 order.status = OrderStatus.REJECTED
                 return
             self._balance -= cost
             self._open_position(order, fill_price, margin)
-        else:
-            # SELL or CLOSE
-            self._close_position(order, fill_price, fee)
 
         order.status = OrderStatus.FILLED
         order.filled_qty = order.quantity

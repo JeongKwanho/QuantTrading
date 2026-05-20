@@ -1,5 +1,5 @@
 """
-Historical backtest — TrendChannelV1 x 3 timeframes
+Historical backtest — TrendChannelV2 (SHORT) x 3 timeframes
 Position (1d) / Swing (4h) / Scalping (1h)  — each 10,000 candles
 """
 
@@ -12,22 +12,21 @@ from binance import AsyncClient
 from backend.broker.base import OrderSide, Signal as BrokerSignal
 from broker.mock import MockBroker
 from strategies.base import FillEvent, MarketData
-from strategies.trend_channel_v1 import TrendChannelV1
+from strategies.trend_channel_v2 import TrendChannelV2
 
-# Windows console UTF-8
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 SYMBOL          = "BTCUSDT"
 N_CANDLES       = 10_000
-INITIAL_BALANCE = 10_000.0   # USDT
+INITIAL_BALANCE = 10_000.0
 LEVERAGE        = 1
-RISK_PCT        = 0.95       # entry 시 가용 잔고 비율
+RISK_PCT        = 0.95
 WINDOW          = 50
 PIVOT_K         = 2
-MIN_RR          = 2.0        # 최소 손익비 (reward / risk)
-COOLDOWN        = 5          # SL 후 재진입 금지 캔들 수
+MIN_RR          = 2.0
+COOLDOWN        = 5
 
 SCENARIOS = [
     {"label": "Position", "timeframe": "1d"},
@@ -44,9 +43,8 @@ INTERVAL_SECONDS = {
 
 
 async def fetch_candles(client: AsyncClient, symbol: str, interval: str, n: int) -> list[dict]:
-    """최근 n개 캔들을 페이징해서 가져온다."""
-    now_ts    = int(datetime.utcnow().timestamp() * 1000)
-    start_ts  = now_ts - n * INTERVAL_SECONDS[interval] * 1000
+    now_ts   = int(datetime.utcnow().timestamp() * 1000)
+    start_ts = now_ts - n * INTERVAL_SECONDS[interval] * 1000
     candles: list[dict] = []
 
     while start_ts < now_ts and len(candles) < n:
@@ -71,11 +69,12 @@ async def fetch_candles(client: AsyncClient, symbol: str, interval: str, n: int)
 async def run_single(
     candles: list[dict], symbol: str,
     zero_fee: bool = False,
-    lev_sizing: bool = False,   # True → qty = balance * leverage / price
 ) -> dict:
-    """단일 시나리오 백테스트."""
-    strategy = TrendChannelV1(leverage=LEVERAGE, window=WINDOW, pivot_k=PIVOT_K, min_rr=MIN_RR, cooldown=COOLDOWN)
-    broker   = MockBroker(
+    strategy = TrendChannelV2(
+        leverage=LEVERAGE, window=WINDOW, pivot_k=PIVOT_K,
+        min_rr=MIN_RR, cooldown=COOLDOWN,
+    )
+    broker = MockBroker(
         initial_balance=INITIAL_BALANCE, leverage=LEVERAGE,
         **({} if not zero_fee else {"taker_fee": 0.0, "maker_fee": 0.0}),
     )
@@ -108,9 +107,9 @@ async def run_single(
 
         for sig in strategy.on_data(data):
             qty = sig.quantity
-            if sig.direction == "BUY" and qty == 0.0:
-                sizing = LEVERAGE if lev_sizing else 1
-                qty = (broker._balance * RISK_PCT * sizing) / candle["close"]
+            if qty == 0.0:
+                # 진입 시그널 (BUY=롱진입 or SELL=숏진입) → 잔고 비례 수량 계산
+                qty = (broker._balance * RISK_PCT) / candle["close"]
             if qty <= 0:
                 continue
 
@@ -119,7 +118,7 @@ async def run_single(
             override_price = None
             if reason == "stop_loss":
                 override_price = sig.metadata.get("sl_price")
-            elif reason == "tp1_upper":
+            elif reason == "tp1_lower":
                 override_price = sig.metadata.get("tp1_price")
 
             if override_price is not None:
@@ -137,26 +136,26 @@ async def run_single(
             if override_price is not None:
                 broker._current_prices[sig.symbol] = candle["close"]
 
+            fill_price = override_price if override_price is not None else candle["close"]
             trade_log.append({
                 "date":   candle["timestamp"].strftime("%Y-%m-%d %H:%M"),
                 "dir":    sig.direction,
                 "qty":    qty,
-                "price":  candle["close"],
+                "price":  fill_price,
                 "reason": sig.metadata.get("reason", ""),
                 "equity": broker.get_total_equity(),
             })
 
         equity_curve.append(broker.get_total_equity())
 
-    fills     = broker.get_fills()
-    buy_fills = [f for f in fills if f.side == OrderSide.BUY]
-    reasons   = [t["reason"] for t in trade_log if t["dir"] == "SELL"]
+    fills      = broker.get_fills()
+    sell_fills = [f for f in fills if f.side == OrderSide.SELL]   # 숏 진입
+    reasons    = [t["reason"] for t in trade_log if t["dir"] == "BUY"]  # 숏 청산
 
-    final  = broker.get_total_equity()
-    ret    = (final - INITIAL_BALANCE) / INITIAL_BALANCE * 100
+    final     = broker.get_total_equity()
+    ret       = (final - INITIAL_BALANCE) / INITIAL_BALANCE * 100
     total_fee = sum(f.fee for f in fills)
 
-    # 최대 낙폭 계산
     peak = INITIAL_BALANCE
     mdd  = 0.0
     for eq in equity_curve:
@@ -169,10 +168,10 @@ async def run_single(
     return {
         "final":      final,
         "return_pct": ret,
-        "n_entry":    len(buy_fills),
+        "n_entry":    len(sell_fills),
         "n_sl":       reasons.count("stop_loss"),
-        "n_tp1":      reasons.count("tp1_upper"),
-        "n_tp2":      reasons.count("tp2_h2"),
+        "n_tp1":      reasons.count("tp1_lower"),
+        "n_tp2":      reasons.count("tp2_l2"),
         "total_fee":  total_fee,
         "mdd":        mdd,
         "trade_log":  trade_log,
@@ -183,7 +182,7 @@ async def run_single(
 
 
 async def main() -> None:
-    print(f"Connecting Binance and fetching data ...\n")
+    print("Connecting Binance and fetching data ...\n")
     client = await AsyncClient.create()
 
     results = {}
@@ -199,50 +198,41 @@ async def main() -> None:
 
     print()
 
-    # ── 4가지 조합 실행 ───────────────────────────────────────────────────────
-    # (1) 고정 수량, fee O  (2) 고정 수량, fee X
-    # (3) 레버 수량, fee O  (4) 레버 수량, fee X
-    runs: dict[str, dict] = {k: {} for k in ["fix_fee", "fix_0", "lev_fee", "lev_0"]}
+    # ── fee O / fee X 두 가지 실행 ───────────────────────────────────────────
+    runs: dict[str, dict] = {k: {} for k in ["fee", "no_fee"]}
     for label, (tf, candles) in results.items():
         print(f"Running backtest: {label} ({tf}) ...", end=" ", flush=True)
-        runs["fix_fee"][label] = (tf, await run_single(candles, SYMBOL, zero_fee=False, lev_sizing=False))
-        runs["fix_0"][label]   = (tf, await run_single(candles, SYMBOL, zero_fee=True,  lev_sizing=False))
-        runs["lev_fee"][label] = (tf, await run_single(candles, SYMBOL, zero_fee=False, lev_sizing=True))
-        runs["lev_0"][label]   = (tf, await run_single(candles, SYMBOL, zero_fee=True,  lev_sizing=True))
-        print(f"done  ({runs['fix_fee'][label][1]['n_entry']} entries)")
+        runs["fee"][label]    = (tf, await run_single(candles, SYMBOL, zero_fee=False))
+        runs["no_fee"][label] = (tf, await run_single(candles, SYMBOL, zero_fee=True))
+        print(f"done  ({runs['fee'][label][1]['n_entry']} entries)")
 
     # ── 비교 테이블 ───────────────────────────────────────────────────────────
-    W = 100
+    W = 90
     print()
     print("=" * W)
-    print(f"  BTCUSDT  |  window={WINDOW}  pivot_k={PIVOT_K}  leverage={LEVERAGE}x  min_rr={MIN_RR}  cooldown={COOLDOWN}")
-    print(f"  sizing=fix: qty = balance/price  |  sizing=lev: qty = balance×{LEVERAGE}/price")
+    print(f"  BTCUSDT (SHORT)  |  window={WINDOW}  pivot_k={PIVOT_K}  leverage={LEVERAGE}x  min_rr={MIN_RR}  cooldown={COOLDOWN}")
     print("=" * W)
-    print(f"  {'Type':<10} {'TF':<5}  {'fix+fee':>9}  {'fix+0%':>8}  {'lev+fee':>9}  {'lev+0%':>8}  {'MDD(lev)':>9}  {'Fee(lev)':>9}")
+    print(f"  {'Type':<10} {'TF':<5}  {'fee':>9}  {'no fee':>8}  {'MDD':>8}  {'Fee':>9}")
     print("-" * W)
-    for label in runs["fix_fee"]:
-        tf = runs["fix_fee"][label][0]
-        rf  = runs["fix_fee"][label][1]
-        rn  = runs["fix_0"][label][1]
-        lf  = runs["lev_fee"][label][1]
-        ln  = runs["lev_0"][label][1]
-        print(f"  {label:<10} {tf:<5}  {rf['return_pct']:>+8.2f}%  {rn['return_pct']:>+7.2f}%  {lf['return_pct']:>+8.2f}%  {ln['return_pct']:>+7.2f}%  {lf['mdd']:>8.1f}%  {lf['total_fee']:>9.2f}")
+    for label in runs["fee"]:
+        tf = runs["fee"][label][0]
+        rf = runs["fee"][label][1]
+        rn = runs["no_fee"][label][1]
+        print(f"  {label:<10} {tf:<5}  {rf['return_pct']:>+8.2f}%  {rn['return_pct']:>+7.2f}%  {rf['mdd']:>7.1f}%  {rf['total_fee']:>9.2f}")
     print("=" * W)
 
     print()
-    print(f"  {'Type':<10} {'TF':<5}  {'Entries':>7} {'SL':>5} {'TP1':>5} {'TP2':>5}  {'fix+fee':>12}  {'fix+0%':>12}  {'lev+fee':>12}  {'lev+0%':>12}")
+    print(f"  {'Type':<10} {'TF':<5}  {'Entries':>7} {'SL':>5} {'TP1':>5} {'TP2':>5}  {'fee':>12}  {'no fee':>12}")
     print("-" * W)
-    for label in runs["fix_fee"]:
-        tf = runs["fix_fee"][label][0]
-        rf  = runs["fix_fee"][label][1]
-        rn  = runs["fix_0"][label][1]
-        lf  = runs["lev_fee"][label][1]
-        ln  = runs["lev_0"][label][1]
-        print(f"  {label:<10} {tf:<5}  {rf['n_entry']:>7} {rf['n_sl']:>5} {rf['n_tp1']:>5} {rf['n_tp2']:>5}  {rf['final']:>12,.2f}  {rn['final']:>12,.2f}  {lf['final']:>12,.2f}  {ln['final']:>12,.2f}")
+    for label in runs["fee"]:
+        tf = runs["fee"][label][0]
+        rf = runs["fee"][label][1]
+        rn = runs["no_fee"][label][1]
+        print(f"  {label:<10} {tf:<5}  {rf['n_entry']:>7} {rf['n_sl']:>5} {rf['n_tp1']:>5} {rf['n_tp2']:>5}  {rf['final']:>12,.2f}  {rn['final']:>12,.2f}")
     print("=" * W)
 
-    # ── 거래 내역 (fix+fee 기준, 최근 30개) ─────────────────────────────────
-    for label, (tf, r) in runs["fix_fee"].items():
+    # ── 거래 내역 (fee 기준, 최근 30개) ──────────────────────────────────────
+    for label, (tf, r) in runs["fee"].items():
         tl = r["trade_log"]
         if not tl:
             print(f"\n  [{label}] No trades.")

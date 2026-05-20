@@ -1,6 +1,6 @@
 """
-Backtest visualization — candlestick + channel lines + H1/H2/L1 pivot markers + trade markers.
-python tools/backtest_chart.py
+Backtest visualization — TrendChannelV2 (SHORT) uptrend channel.
+python tools/backtest_chart_v2.py
 """
 
 import asyncio
@@ -17,7 +17,7 @@ from binance import AsyncClient
 from backend.broker.base import OrderSide, Signal as BrokerSignal
 from broker.mock import MockBroker
 from strategies.base import FillEvent, MarketData
-from strategies.trend_channel_v1 import TrendChannelV1
+from strategies.trend_channel_v2 import TrendChannelV2
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -72,7 +72,7 @@ async def fetch_candles(
 
 async def run_and_record(candles: list[dict], symbol: str) -> tuple[list, list, list]:
     """백테스트 실행 + 캔들별 채널 상태 / 거래 내역 / 채널 피벗 기록."""
-    strategy = TrendChannelV1(
+    strategy = TrendChannelV2(
         leverage=LEVERAGE, window=WINDOW, pivot_k=PIVOT_K, min_rr=MIN_RR, cooldown=COOLDOWN
     )
     broker = MockBroker(initial_balance=INITIAL_BALANCE, leverage=LEVERAGE)
@@ -105,10 +105,9 @@ async def run_and_record(candles: list[dict], symbol: str) -> tuple[list, list, 
 
         signals = strategy.on_data(data)
 
-        ch          = strategy._pattern.downtrend_channel
+        ch          = strategy._pattern.uptrend_channel
         curr_locked = strategy._pattern._locked
 
-        # 현재 캔들 기록 (일단 ch 값 그대로)
         candle_records.append({
             "ts":    ts_str,
             "o":     candle["open"],
@@ -119,53 +118,51 @@ async def run_and_record(candles: list[dict], symbol: str) -> tuple[list, list, 
             "upper": ch.upper_now if ch else None,
         })
 
-        # 채널이 새로 lock된 순간 → H1부터 현재까지 소급 채우기
+        # 채널이 새로 lock된 순간 → L1부터 현재까지 소급 채우기
         if curr_locked and not prev_locked and ch is not None:
             hist = strategy._pattern._history
             try:
-                # downtrend: l1=H1(첫 고점), l2=H2(두번째 고점), h1=L1(저점)
-                h1_ts_str = hist[ch.l1_idx].timestamp.strftime("%Y-%m-%dT%H:%M:%S")
-                h2_ts_str = hist[ch.l2_idx].timestamp.strftime("%Y-%m-%dT%H:%M:%S")
-                l1_ts_str = hist[ch.h1_idx].timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+                # uptrend: l1=L1(첫 저점), l2=L2(두번째 저점), h1=H1(고점)
+                l1_ts_str = hist[ch.l1_idx].timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+                l2_ts_str = hist[ch.l2_idx].timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+                h1_ts_str = hist[ch.h1_idx].timestamp.strftime("%Y-%m-%dT%H:%M:%S")
                 channel_pivots.append({
-                    "H1_ts": h1_ts_str, "H1_price": ch.l1_price,
-                    "H2_ts": h2_ts_str, "H2_price": ch.l2_price,
-                    "L1_ts": l1_ts_str, "L1_price": ch.h1_price,
+                    "L1_ts": l1_ts_str, "L1_price": ch.l1_price,
+                    "L2_ts": l2_ts_str, "L2_price": ch.l2_price,
+                    "H1_ts": h1_ts_str, "H1_price": ch.h1_price,
                 })
 
-                # H1의 candle_records 인덱스를 타임스탬프로 역검색
-                h1_rec_idx = None
+                # L1의 candle_records 인덱스를 타임스탬프로 역검색
+                l1_rec_idx = None
                 for ri in range(len(candle_records) - 1, -1, -1):
-                    if candle_records[ri]["ts"] == h1_ts_str:
-                        h1_rec_idx = ri
+                    if candle_records[ri]["ts"] == l1_ts_str:
+                        l1_rec_idx = ri
                         break
 
-                # H1 ~ 현재까지 upper/lower 소급 계산
-                # upper_i = h1_price + slope * steps  → H1/H2/L1 모두 통과
-                if h1_rec_idx is not None:
-                    for ri in range(h1_rec_idx, len(candle_records)):
-                        steps   = ri - h1_rec_idx
-                        upper_i = ch.l1_price + ch.slope * steps
-                        lower_i = upper_i - ch.channel_gap
-                        candle_records[ri]["upper"] = upper_i
+                # L1 ~ 현재까지 lower/upper 소급 계산
+                if l1_rec_idx is not None:
+                    for ri in range(l1_rec_idx, len(candle_records)):
+                        steps   = ri - l1_rec_idx
+                        lower_i = ch.l1_price + ch.slope * steps
+                        upper_i = lower_i + ch.channel_gap
                         candle_records[ri]["lower"] = lower_i
+                        candle_records[ri]["upper"] = upper_i
             except (IndexError, AttributeError):
                 pass
         prev_locked = curr_locked
 
         for sig in signals:
             qty = sig.quantity
-            if sig.direction == "BUY" and qty == 0.0:
+            if qty == 0.0:
                 qty = (broker._balance * RISK_PCT) / candle["close"]
             if qty <= 0:
                 continue
 
-            # SL / TP1: 터치 가격에서 시장가 체결
             reason = sig.metadata.get("reason", "")
             override_price = None
             if reason == "stop_loss":
                 override_price = sig.metadata.get("sl_price")
-            elif reason == "tp1_upper":
+            elif reason == "tp1_lower":
                 override_price = sig.metadata.get("tp1_price")
 
             if override_price is not None:
@@ -185,16 +182,16 @@ async def run_and_record(candles: list[dict], symbol: str) -> tuple[list, list, 
 
             fill_price = override_price if override_price is not None else candle["close"]
 
-            if sig.direction == "BUY":
+            if sig.direction == "SELL":  # 숏 진입
                 open_trade = {
                     "entry_ts":    ts_str,
                     "entry_price": candle["close"],
-                    "sl_price":    sig.metadata.get("sl", candle["low"]),
+                    "sl_price":    sig.metadata.get("sl", candle["high"]),
                     "tp1_price":   sig.metadata.get("tp1", 0.0),
                     "tp2_price":   sig.metadata.get("tp2", 0.0),
                     "exits": [],
                 }
-            elif sig.direction == "SELL" and open_trade is not None:
+            elif sig.direction == "BUY" and open_trade is not None:  # 숏 청산
                 open_trade["exits"].append({
                     "ts":     ts_str,
                     "price":  fill_price,
@@ -228,14 +225,14 @@ def build_chart_data(
     )
 
     return {
-        "label":           label,
+        "label":          label,
         "ts": ts, "o": o, "h": h, "l": l, "c": c,
-        "lower":           lower,
-        "upper":           upper,
-        "trades":          trades,
-        "channel_pivots":  channel_pivots,
-        "n_tr":            n_tr,
-        "wins":            wins,
+        "lower":          lower,
+        "upper":          upper,
+        "trades":         trades,
+        "channel_pivots": channel_pivots,
+        "n_tr":           n_tr,
+        "wins":           wins,
     }
 
 
@@ -243,24 +240,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Backtest — BTCUSDT TrendChannelV1</title>
+<title>Backtest — BTCUSDT TrendChannelV2 (SHORT)</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif; height: 100vh; display: flex; flex-direction: column; }
 #header { padding: 8px 12px; background: #181825; border-bottom: 1px solid #313244; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-#header h2 { font-size: 13px; color: #89b4fa; white-space: nowrap; }
+#header h2 { font-size: 13px; color: #a6e3a1; white-space: nowrap; }
 .tabs { display: flex; gap: 4px; }
 .tab { padding: 5px 14px; background: #313244; border: none; color: #cdd6f4; cursor: pointer; border-radius: 4px; font-size: 13px; transition: background .15s; }
 .tab:hover { background: #45475a; }
-.tab.active { background: #89b4fa; color: #1e1e2e; font-weight: 600; }
+.tab.active { background: #a6e3a1; color: #1e1e2e; font-weight: 600; }
 #stats { margin-left: auto; font-size: 12px; color: #a6adc8; white-space: nowrap; }
 #chart { flex: 1; min-height: 0; }
 </style>
 </head>
 <body>
 <div id="header">
-  <h2>BTCUSDT · TrendChannelV1 · window=__WINDOW__ pivot_k=__PIVOT_K__ min_rr=__MIN_RR__ leverage=__LEVERAGE__x</h2>
+  <h2>BTCUSDT · TrendChannelV2 SHORT · window=__WINDOW__ pivot_k=__PIVOT_K__ min_rr=__MIN_RR__ leverage=__LEVERAGE__x</h2>
   <div class="tabs" id="tabs"></div>
   <div id="stats"></div>
 </div>
@@ -273,7 +270,7 @@ function renderChart(key) {
   const d = ALL[key];
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tf === key));
   document.getElementById('stats').textContent =
-    `거래 ${d.n_tr}건  승 ${d.wins}건  패 ${d.n_tr - d.wins}건  승률 ${d.n_tr ? Math.round(d.wins/d.n_tr*100) : 0}%`;
+    `숏 ${d.n_tr}건  승 ${d.wins}건  패 ${d.n_tr - d.wins}건  승률 ${d.n_tr ? Math.round(d.wins/d.n_tr*100) : 0}%`;
 
   const traces = [];
 
@@ -290,7 +287,7 @@ function renderChart(key) {
   traces.push({
     type: 'scatter', name: '채널 하단', x: d.ts, y: d.lower,
     mode: 'lines', connectgaps: false,
-    line: { color: 'rgba(239,83,80,0.6)', dash: 'dot', width: 1.5 },
+    line: { color: 'rgba(38,166,154,0.6)', dash: 'dot', width: 1.5 },
     hoverinfo: 'skip',
   });
 
@@ -298,62 +295,62 @@ function renderChart(key) {
   traces.push({
     type: 'scatter', name: '채널 상단', x: d.ts, y: d.upper,
     mode: 'lines', connectgaps: false,
-    fill: 'tonexty', fillcolor: 'rgba(239,83,80,0.06)',
-    line: { color: 'rgba(239,83,80,0.4)', dash: 'dot', width: 1.5 },
+    fill: 'tonexty', fillcolor: 'rgba(38,166,154,0.06)',
+    line: { color: 'rgba(38,166,154,0.4)', dash: 'dot', width: 1.5 },
     hoverinfo: 'skip',
   });
 
-  /* ── 채널 피벗 마커: H1, H2, L1 ── */
-  const h1x = [], h1y = [], h2x = [], h2y = [], l1x = [], l1y = [];
+  /* ── 채널 피벗 마커: L1, H1, L2 ── */
+  const l1x = [], l1y = [], h1x = [], h1y = [], l2x = [], l2y = [];
   for (const p of d.channel_pivots) {
-    h1x.push(p.H1_ts); h1y.push(p.H1_price);
-    h2x.push(p.H2_ts); h2y.push(p.H2_price);
     l1x.push(p.L1_ts); l1y.push(p.L1_price);
+    h1x.push(p.H1_ts); h1y.push(p.H1_price);
+    l2x.push(p.L2_ts); l2y.push(p.L2_price);
   }
-
-  if (h1x.length) traces.push({
-    type: 'scatter', mode: 'markers+text', name: 'H1',
-    x: h1x, y: h1y,
-    text: h1y.map(() => 'H1'), textposition: 'top center',
-    marker: { symbol: 'diamond', size: 12, color: '#fab387',
-              line: { color: '#1e1e2e', width: 1.5 } },
-    textfont: { size: 11, color: '#fab387' },
-  });
-
-  if (h2x.length) traces.push({
-    type: 'scatter', mode: 'markers+text', name: 'H2',
-    x: h2x, y: h2y,
-    text: h2y.map(() => 'H2'), textposition: 'top center',
-    marker: { symbol: 'diamond', size: 12, color: '#cba6f7',
-              line: { color: '#1e1e2e', width: 1.5 } },
-    textfont: { size: 11, color: '#cba6f7' },
-  });
 
   if (l1x.length) traces.push({
     type: 'scatter', mode: 'markers+text', name: 'L1',
     x: l1x, y: l1y,
     text: l1y.map(() => 'L1'), textposition: 'bottom center',
+    marker: { symbol: 'diamond', size: 12, color: '#fab387',
+              line: { color: '#1e1e2e', width: 1.5 } },
+    textfont: { size: 11, color: '#fab387' },
+  });
+
+  if (h1x.length) traces.push({
+    type: 'scatter', mode: 'markers+text', name: 'H1',
+    x: h1x, y: h1y,
+    text: h1y.map(() => 'H1'), textposition: 'top center',
+    marker: { symbol: 'diamond', size: 12, color: '#cba6f7',
+              line: { color: '#1e1e2e', width: 1.5 } },
+    textfont: { size: 11, color: '#cba6f7' },
+  });
+
+  if (l2x.length) traces.push({
+    type: 'scatter', mode: 'markers+text', name: 'L2',
+    x: l2x, y: l2y,
+    text: l2y.map(() => 'L2'), textposition: 'bottom center',
     marker: { symbol: 'diamond', size: 12, color: '#94e2d5',
               line: { color: '#1e1e2e', width: 1.5 } },
     textfont: { size: 11, color: '#94e2d5' },
   });
 
   /* ── 거래 마커 ── */
-  const buys = [], sl = [], tp1 = [], tp2 = [];
+  const shorts = [], sl = [], tp1 = [], tp2 = [];
   for (const t of d.trades) {
-    buys.push({ ts: t.entry_ts, price: t.entry_price });
+    shorts.push({ ts: t.entry_ts, price: t.entry_price });
     for (const e of t.exits) {
       if (e.reason === 'stop_loss')    sl.push(e);
-      else if (e.reason === 'tp1_upper') tp1.push(e);
-      else if (e.reason === 'tp2_h2')   tp2.push(e);
+      else if (e.reason === 'tp1_lower') tp1.push(e);
+      else if (e.reason === 'tp2_l2')   tp2.push(e);
     }
   }
 
   const mk = { type: 'scatter', mode: 'markers' };
 
-  if (buys.length) traces.push({ ...mk, name: '매수',
-    x: buys.map(b=>b.ts), y: buys.map(b=>b.price),
-    marker: { symbol: 'triangle-up', size: 13, color: '#a6e3a1',
+  if (shorts.length) traces.push({ ...mk, name: '숏진입',
+    x: shorts.map(b=>b.ts), y: shorts.map(b=>b.price),
+    marker: { symbol: 'triangle-down', size: 13, color: '#f38ba8',
               line: { color: '#1e1e2e', width: 1.5 } } });
 
   if (sl.length) traces.push({ ...mk, name: '손절(SL)',
@@ -473,7 +470,7 @@ async def main() -> None:
         .replace("__LEVERAGE__", str(LEVERAGE))
     )
 
-    out = Path(__file__).parent / "backtest_result.html"
+    out = Path(__file__).parent / "backtest_result_v2.html"
     out.write_text(html, encoding="utf-8")
     print(f"\nSaved → {out}")
     webbrowser.open(out.as_uri())
