@@ -62,6 +62,7 @@ class OBChannelV1(BaseStrategy):
 
     def _reset_ob(self) -> None:
         self._ob_ts:              datetime | None = None
+        self._ob_detected_ts:     datetime | None = None  # 엔건핑 봉 타임스탬프 (진입 금지 봉)
         self._ob_open:            float = 0.0
         self._ob_close:           float = 0.0
         self._ob_mid:             float = 0.0
@@ -126,13 +127,14 @@ class OBChannelV1(BaseStrategy):
 
     def _on_new_ob(self, ob: OrderBlock, data: MarketData) -> None:
         self._reset_ob()
-        self._ob_ts    = ob.timestamp
-        self._ob_open  = ob.ob_open
-        self._ob_close = ob.ob_close
-        self._ob_mid   = (ob.ob_open + ob.ob_close) / 2
-        self._ob_low   = ob.ob_low
-        self._tp2_price = self._calc_tp2(ob)
-        self._max_high_since_ob = data.high
+        self._ob_ts          = ob.timestamp
+        self._ob_detected_ts = data.timestamp   # 엔건핑 봉: 이 봉에서는 진입 안 함
+        self._ob_open        = ob.ob_open
+        self._ob_close       = ob.ob_close
+        self._ob_mid         = (ob.ob_open + ob.ob_close) / 2
+        self._ob_low         = ob.ob_low
+        self._tp2_price      = self._calc_tp2(ob)
+        self._max_high_since_ob = data.high     # TP1 추적은 엔건핑 봉 high부터 시작
 
     def _calc_tp2(self, ob: OrderBlock) -> float:
         """OB 이전 tp2_lookback 봉 중 최고 고점."""
@@ -148,6 +150,10 @@ class OBChannelV1(BaseStrategy):
 
     def _check_first_entry(self, data: MarketData) -> list[Signal]:
         self._max_high_since_ob = max(self._max_high_since_ob, data.high)
+
+        # 엔건핑 봉(OB 확인 봉)에서는 진입 불가 — 다음 봉부터 허용
+        if data.timestamp == self._ob_detected_ts:
+            return []
 
         if data.low > self._ob_open:
             return []
@@ -236,7 +242,7 @@ class OBChannelV1(BaseStrategy):
                 )]
 
             if data.high >= self._tp1_price:
-                sell_qty       = round(self._position_qty * 0.5, 8)
+                sell_qty       = self._position_qty  # 전량 매도 (TP2 임시 제거)
                 self._tp1_done = True
                 return [Signal(
                     symbol        = data.symbol,
@@ -249,19 +255,7 @@ class OBChannelV1(BaseStrategy):
                 )]
 
         else:
-            # TP1 후: TP2 → SL2 순서
-            if self._tp2_price > 0 and data.high >= self._tp2_price:
-                qty = self._position_qty
-                return [Signal(
-                    symbol        = data.symbol,
-                    direction     = "SELL",
-                    quantity      = qty,
-                    price         = None,
-                    strategy_name = self.name,
-                    timestamp     = data.timestamp,
-                    metadata      = {"reason": "tp2", "tp2_price": self._tp2_price},
-                )]
-
+            # TP2 임시 비활성화 — TP1 전량 매도로 대체
             if data.low <= self._avg_price:
                 qty = self._position_qty
                 return [Signal(
