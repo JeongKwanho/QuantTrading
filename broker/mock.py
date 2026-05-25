@@ -59,6 +59,7 @@ class MockBroker(BaseBroker):
         self._orders: dict[str, Order] = {}
         self._fills: list[Fill] = []
         self._current_prices: dict[str, float] = {}
+        self._funding_fees: float = 0.0
 
     # ── 연결 관리 ─────────────────────────────────────────────────────────
 
@@ -176,6 +177,26 @@ class MockBroker(BaseBroker):
             total += p.margin + self._calc_upnl(p, current)
         return total
 
+    def apply_funding_rate(self, symbol: str, funding_rate: float) -> float:
+        """Apply one perpetual futures funding event and return the fee paid.
+
+        Positive funding means longs pay shorts. Negative funding means longs receive.
+        """
+        pos = self._positions.get(symbol)
+        if not pos:
+            return 0.0
+
+        current = self._current_prices.get(symbol, pos.entry_price)
+        notional = current * pos.size
+        side_multiplier = 1 if pos.side == OrderSide.BUY else -1
+        fee = notional * funding_rate * side_multiplier
+        self._balance -= fee
+        self._funding_fees += fee
+        return fee
+
+    def get_funding_fees(self) -> float:
+        return self._funding_fees
+
     def get_fills(self) -> list[Fill]:
         return list(self._fills)
 
@@ -186,6 +207,7 @@ class MockBroker(BaseBroker):
         self._orders.clear()
         self._fills.clear()
         self._current_prices.clear()
+        self._funding_fees = 0.0
 
     # ── 내부 계산 ─────────────────────────────────────────────────────────
 
@@ -229,6 +251,21 @@ class MockBroker(BaseBroker):
             self._on_fill_callback(fill)
 
     def _open_position(self, order: Order, price: float, margin: float) -> None:
+        existing = self._positions.get(order.symbol)
+        if existing is not None and existing.side == order.side:
+            total_qty = existing.size + order.quantity
+            existing.entry_price = (
+                existing.entry_price * existing.size + price * order.quantity
+            ) / total_qty
+            existing.size = total_qty
+            existing.margin += margin
+            existing.liquidation_price = _calc_liquidation_price(
+                existing.side,
+                existing.entry_price,
+                self._leverage,
+            )
+            return
+
         liq = _calc_liquidation_price(order.side, price, self._leverage)
         self._positions[order.symbol] = _MockPosition(
             symbol=order.symbol,
@@ -241,11 +278,24 @@ class MockBroker(BaseBroker):
         )
 
     def _close_position(self, order: Order, price: float, fee: float) -> None:
-        pos = self._positions.pop(order.symbol, None)
+        pos = self._positions.get(order.symbol)
         if not pos:
             return
-        pnl = self._calc_upnl(pos, price)
-        self._balance += pos.margin + pnl - fee
+        close_qty = min(order.quantity, pos.size)
+        close_ratio = close_qty / pos.size if pos.size else 0.0
+        released_margin = pos.margin * close_ratio
+
+        if pos.side == OrderSide.BUY:
+            pnl = (price - pos.entry_price) * close_qty
+        else:
+            pnl = (pos.entry_price - price) * close_qty
+
+        self._balance += released_margin + pnl - fee
+        pos.size -= close_qty
+        pos.margin -= released_margin
+
+        if pos.size <= 1e-12:
+            del self._positions[order.symbol]
 
     def _calc_upnl(self, pos: _MockPosition, current_price: float) -> float:
         if pos.side == OrderSide.BUY:
