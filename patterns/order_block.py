@@ -33,10 +33,20 @@ class OrderBlockPattern(BasePattern):
     pivot_k : pivot confirmation half-width (same as TrendLinePattern)
     """
 
-    def __init__(self, window: int = 10, pivot_k: int = 2, trend_window: int = 30, **kwargs) -> None:
+    def __init__(
+        self,
+        window: int = 10,
+        pivot_k: int = 2,
+        trend_window: int = 30,
+        min_drop_atr: float = 1.0,
+        max_ob_range_pos: float = 0.65,
+        **kwargs,
+    ) -> None:
         self.window       = window
         self.pivot_k      = pivot_k
         self.trend_window = trend_window
+        self.min_drop_atr = min_drop_atr
+        self.max_ob_range_pos = max_ob_range_pos
         self._history: list[MarketData] = []
         self.bullish_ob: OrderBlock | None = None
         self._invalidated_ob_ts: datetime | None = None
@@ -82,9 +92,10 @@ class OrderBlockPattern(BasePattern):
         last_low  = self._history[sorted_lows[-1]].low
         prev_low  = self._history[sorted_lows[-2]].low
 
-        is_downtrend = (last_high < prev_high) and (last_low < prev_low)
+        has_lh_ll = (last_high < prev_high) and (last_low < prev_low)
+        has_hh_hl = (last_high > prev_high) and (last_low > prev_low)
 
-        if not is_downtrend:
+        if not has_lh_ll:
             return PatternResult(
                 detected=self.bullish_ob is not None and self.bullish_ob.valid,
                 direction=None, strength=0.0, name=self.name,
@@ -102,6 +113,8 @@ class OrderBlockPattern(BasePattern):
             bull_body = bull.close - bull.open   # > 0 이면 양봉
 
             if bear_body > 0 and bull_body > bear_body:
+                if not self._is_valid_down_leg_ob(i, sorted_highs, has_hh_hl):
+                    continue
                 candidate = OrderBlock(
                     ob_open   = bear.open,
                     ob_close  = bear.close,
@@ -159,6 +172,47 @@ class OrderBlockPattern(BasePattern):
                 pivots.append(i)
 
         return pivots
+
+    def _is_valid_down_leg_ob(self, ob_idx: int, pivot_highs: list[int], has_hh_hl: bool) -> bool:
+        """Confirm the OB candle sits in a meaningful drop from a previous swing high."""
+        if has_hh_hl:
+            return False
+
+        prev_highs = [idx for idx in pivot_highs if idx < ob_idx]
+        if not prev_highs:
+            return False
+
+        high_idx = prev_highs[-1]
+        high_price = self._history[high_idx].high
+        leg = self._history[high_idx:ob_idx + 1]
+        if not leg:
+            return False
+
+        leg_low = min(c.low for c in leg)
+        drop = high_price - leg_low
+        atr = self._calc_atr(end_idx=ob_idx, period=min(14, self.trend_window))
+        if atr <= 0.0 or drop < atr * self.min_drop_atr:
+            return False
+
+        ob_close = self._history[ob_idx].close
+        if high_price <= leg_low:
+            return False
+
+        range_pos = (ob_close - leg_low) / (high_price - leg_low)
+        return range_pos <= self.max_ob_range_pos
+
+    def _calc_atr(self, end_idx: int, period: int = 14) -> float:
+        start = max(1, end_idx - period + 1)
+        trs: list[float] = []
+        for i in range(start, end_idx + 1):
+            cur = self._history[i]
+            prev = self._history[i - 1]
+            trs.append(max(
+                cur.high - cur.low,
+                abs(cur.high - prev.close),
+                abs(cur.low - prev.close),
+            ))
+        return sum(trs) / len(trs) if trs else 0.0
 
     def _no_signal(self) -> PatternResult:
         return PatternResult(detected=False, direction=None, strength=0.0, name=self.name)
