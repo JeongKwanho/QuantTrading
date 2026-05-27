@@ -14,6 +14,7 @@ from binance import AsyncClient
 
 from backend.broker.base import OrderSide, Signal as BrokerSignal
 from broker.mock import MockBroker
+from patterns.trend_line import TrendLinePatternUp
 from strategies.base import BaseStrategy, FillEvent, MarketData
 from strategies.decrease_trend_channer_v1 import DecreaseTrendChannerV1
 from strategies.trend_channel_v1 import TrendChannelV1
@@ -46,6 +47,14 @@ INTERVAL_SECONDS = {
     "1h": 3600,
     "15m": 900,
     "5m": 300,
+}
+
+BULL_STRUCTURE_TIMEFRAME = {
+    "1d": "1d",
+    "4h": "1d",
+    "1h": "4h",
+    "15m": "4h",
+    "5m": "1h",
 }
 
 
@@ -254,6 +263,49 @@ def build_bull_flags(
     return flags
 
 
+def build_bull_structure_flags(
+    candles: list[dict],
+    higher_candles: list[dict],
+    window: int = WINDOW,
+    pivot_k: int = PIVOT_K,
+    grace_bars: int = 10,
+) -> list[bool]:
+    higher_states: list[tuple[datetime, bool, int]] = []
+    pattern = TrendLinePatternUp(window=window, pivot_k=pivot_k)
+
+    for state_idx, candle in enumerate(higher_candles):
+        data = MarketData(
+            symbol=SYMBOL,
+            timestamp=candle["timestamp"],
+            open=candle["open"],
+            high=candle["high"],
+            low=candle["low"],
+            close=candle["close"],
+            volume=candle["volume"],
+        )
+        pattern.evaluate(data)
+        channel = pattern.uptrend_channel
+        bull = channel is not None and candle["close"] >= channel.lower_now
+        higher_states.append((candle["timestamp"], bull, state_idx))
+
+    flags: list[bool] = []
+    h_idx = 0
+    current_state_idx = -1
+    last_bull_state_idx: int | None = None
+    for candle in candles:
+        while h_idx < len(higher_states) and higher_states[h_idx][0] <= candle["timestamp"]:
+            current_state_idx = higher_states[h_idx][2]
+            if higher_states[h_idx][1]:
+                last_bull_state_idx = current_state_idx
+            h_idx += 1
+        flags.append(
+            last_bull_state_idx is not None
+            and current_state_idx - last_bull_state_idx <= grace_bars
+        )
+
+    return flags
+
+
 async def main() -> None:
     print("Connecting Binance and fetching candles ...\n")
     client = await AsyncClient.create()
@@ -275,12 +327,20 @@ async def main() -> None:
         "base_bull": {},
         "improved": {},
         "bull": {},
+        "structure": {},
     }
 
     for label, (timeframe, candles) in candles_by_label.items():
         print(f"\nRunning {label} ({timeframe}) ...")
         base = await run_single(candles, SYMBOL, TrendChannelV1)
         bull_flags = build_bull_flags(candles, candles)
+        structure_timeframe = BULL_STRUCTURE_TIMEFRAME[timeframe]
+        structure_candles = next(
+            candles
+            for tf, candles in candles_by_label.values()
+            if tf == structure_timeframe
+        )
+        structure_flags = build_bull_structure_flags(candles, structure_candles)
         base_bull = await run_single(
             candles,
             SYMBOL,
@@ -295,25 +355,38 @@ async def main() -> None:
             strategy_kwargs={"require_bull_market": True},
             bull_flags=bull_flags,
         )
+        structure = await run_single(
+            candles,
+            SYMBOL,
+            DecreaseTrendChannerV1,
+            strategy_kwargs={"require_bull_market": True},
+            bull_flags=structure_flags,
+        )
         runs["base"][label] = (timeframe, base)
         runs["base_bull"][label] = (timeframe, base_bull)
         runs["improved"][label] = (timeframe, improved)
         runs["bull"][label] = (timeframe, bull)
+        runs["structure"][label] = (timeframe, structure)
         print(f"  base entries={base['entries']} return={base['return_pct']:+.2f}%")
         print(f"  base+bull entries={base_bull['entries']} return={base_bull['return_pct']:+.2f}%")
         print(f"  improved entries={improved['entries']} return={improved['return_pct']:+.2f}%")
         print(f"  bull-filter entries={bull['entries']} return={bull['return_pct']:+.2f}%")
+        print(
+            f"  structure-filter entries={structure['entries']} "
+            f"return={structure['return_pct']:+.2f}% "
+            f"context={structure_timeframe}"
+        )
 
-    width = 126
+    width = 146
     print()
     print("=" * width)
     print(f"  {SYMBOL} TrendChannelV1 vs DecreaseTrendChannerV1 | candles={N_CANDLES} window={WINDOW} pivot_k={PIVOT_K} min_rr={MIN_RR}")
     print("=" * width)
     print(
         f"  {'Type':<10} {'TF':<5} "
-        f"{'Base':>9} {'Base+B':>9} {'New':>9} {'New+B':>9} "
-        f"{'BaseEnt':>8} {'BaseBEnt':>8} {'NewEnt':>8} {'NewBEnt':>8} "
-        f"{'BaseSL':>7} {'BaseBSL':>7} {'NewSL':>7} {'NewBSL':>7}"
+        f"{'Base':>9} {'Base+B':>9} {'New':>9} {'New+MA':>9} {'New+Struct':>11} "
+        f"{'BaseEnt':>8} {'BaseBEnt':>8} {'NewEnt':>8} {'MAEnt':>7} {'StructEnt':>9} "
+        f"{'BaseSL':>7} {'BaseBSL':>7} {'NewSL':>7} {'MASL':>6} {'StructSL':>8}"
     )
     print("-" * width)
 
@@ -321,12 +394,16 @@ async def main() -> None:
         improved = runs["improved"][label][1]
         base_bull = runs["base_bull"][label][1]
         bull = runs["bull"][label][1]
+        structure = runs["structure"][label][1]
         print(
             f"  {label:<10} {timeframe:<5} "
             f"{base['return_pct']:>+8.2f}% {base_bull['return_pct']:>+8.2f}% "
             f"{improved['return_pct']:>+8.2f}% {bull['return_pct']:>+8.2f}% "
-            f"{base['entries']:>8} {base_bull['entries']:>8} {improved['entries']:>8} {bull['entries']:>8} "
-            f"{base['sl']:>7} {base_bull['sl']:>7} {improved['sl']:>7} {bull['sl']:>7}"
+            f"{structure['return_pct']:>+10.2f}% "
+            f"{base['entries']:>8} {base_bull['entries']:>8} {improved['entries']:>8} "
+            f"{bull['entries']:>7} {structure['entries']:>9} "
+            f"{base['sl']:>7} {base_bull['sl']:>7} {improved['sl']:>7} "
+            f"{bull['sl']:>6} {structure['sl']:>8}"
         )
 
     print("=" * width)

@@ -1,35 +1,28 @@
 from typing import Literal
 
 from strategies.base import MarketData, Signal
-from strategies.layers import TimeframeLayer, Direction
+from strategies.layers import Direction, TimeframeLayer
 
 
-# 지원하는 시간봉 목록
-LARGE_TIMEFRAMES  = ["1d", "1w", "3d"]
+LARGE_TIMEFRAMES = ["1d", "1w", "3d"]
 MEDIUM_TIMEFRAMES = ["4h", "6h", "8h", "12h"]
-SMALL_TIMEFRAMES  = ["1m", "3m", "5m", "15m", "30m", "1h"]
+SMALL_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h"]
 
 
 class BaseGroup:
-    """
-    모든 전략 그룹의 공통 베이스.
-    on_candle()으로 시간봉 데이터를 받고,
-    최종 Signal이 확정되면 반환한다.
-    """
+    """Common base for multi-timeframe strategy groups."""
+
     trade_type: Literal["scalping", "swing", "position"] = "swing"
 
     @property
     def timeframes(self) -> list[str]:
-        """이 그룹에 필요한 모든 시간봉 목록 (큰 → 작은 순서)."""
         raise NotImplementedError
 
     @property
     def primary_timeframe(self) -> str:
-        """가장 작은(빠른) 시간봉 — 백테스트 equity curve 기준."""
         return self.timeframes[-1]
 
     def all_strategies(self):
-        """그룹 내 모든 전략 인스턴스를 반환 (on_fill 연결 등에 사용)."""
         raise NotImplementedError
 
     def on_candle(self, timeframe: str, data: MarketData) -> list[Signal]:
@@ -41,25 +34,36 @@ class BaseGroup:
     def to_dict(self) -> dict:
         raise NotImplementedError
 
-    def _build_signal(self, data: MarketData, direction: Direction) -> list[Signal]:
+    def _build_signal(
+        self,
+        data: MarketData,
+        direction: Direction,
+        source_signal: Signal | None = None,
+    ) -> list[Signal]:
         if direction is None:
             return []
+
+        metadata = {"trade_type": self.trade_type}
+        if source_signal is not None:
+            metadata.update(source_signal.metadata)
+            metadata["trade_type"] = self.trade_type
+            metadata["source_strategy"] = source_signal.strategy_name
+            metadata["source_timestamp"] = source_signal.timestamp.isoformat()
+
         return [Signal(
-            symbol=data.symbol,
+            symbol=source_signal.symbol if source_signal is not None else data.symbol,
             direction=direction,
-            quantity=0.0,        # 실제 수량은 리스크 매니저 또는 전략이 결정
-            price=None,          # 시장가
+            quantity=source_signal.quantity if source_signal is not None else 0.0,
+            price=source_signal.price if source_signal is not None else None,
             strategy_name=f"{self.trade_type}_group",
-            timestamp=data.timestamp,
-            metadata={"trade_type": self.trade_type},
+            timestamp=source_signal.timestamp if source_signal is not None else data.timestamp,
+            metadata=metadata,
         )]
 
 
 class ScalpingGroup(BaseGroup):
-    """
-    단타: 큰봉 → 중간봉 → 작은봉 순서로 3단계 필터링.
-    작은봉에서 신호가 나올 때, 위 두 레이어가 모두 같은 방향으로 확정되어야 한다.
-    """
+    """Three-layer confirmation: large, medium, then small timeframe trigger."""
+
     trade_type = "scalping"
 
     def __init__(
@@ -68,12 +72,12 @@ class ScalpingGroup(BaseGroup):
         medium: TimeframeLayer,
         small: TimeframeLayer,
     ) -> None:
-        assert large.timeframe in LARGE_TIMEFRAMES,  f"large timeframe must be one of {LARGE_TIMEFRAMES}"
+        assert large.timeframe in LARGE_TIMEFRAMES, f"large timeframe must be one of {LARGE_TIMEFRAMES}"
         assert medium.timeframe in MEDIUM_TIMEFRAMES, f"medium timeframe must be one of {MEDIUM_TIMEFRAMES}"
-        assert small.timeframe in SMALL_TIMEFRAMES,  f"small timeframe must be one of {SMALL_TIMEFRAMES}"
-        self.large  = large
+        assert small.timeframe in SMALL_TIMEFRAMES, f"small timeframe must be one of {SMALL_TIMEFRAMES}"
+        self.large = large
         self.medium = medium
-        self.small  = small
+        self.small = small
 
     @property
     def timeframes(self) -> list[str]:
@@ -90,16 +94,15 @@ class ScalpingGroup(BaseGroup):
             self.medium.evaluate(data)
 
         elif timeframe == self.small.timeframe:
-            small_result  = self.small.evaluate(data)
+            small_result = self.small.evaluate(data)
             medium_result = self.medium.confirmed_direction
-            large_result  = self.large.confirmed_direction
+            large_result = self.large.confirmed_direction
 
-            # 3레이어 전부 같은 방향일 때만 Signal 발생
             if (
                 small_result.confirmed
                 and small_result.direction == medium_result == large_result
             ):
-                return self._build_signal(data, small_result.direction)
+                return self._build_signal(data, small_result.direction, small_result.signal)
 
         return []
 
@@ -112,18 +115,16 @@ class ScalpingGroup(BaseGroup):
         return {
             "trade_type": self.trade_type,
             "layers": {
-                "large":  self.large.to_dict(),
+                "large": self.large.to_dict(),
                 "medium": self.medium.to_dict(),
-                "small":  self.small.to_dict(),
+                "small": self.small.to_dict(),
             },
         }
 
 
 class SwingGroup(BaseGroup):
-    """
-    스윙: 큰봉 → 중간봉 순서로 2단계 필터링.
-    중간봉에서 신호가 나올 때, 큰봉이 같은 방향으로 확정되어야 한다.
-    """
+    """Two-layer confirmation: large timeframe context, medium trigger."""
+
     trade_type = "swing"
 
     def __init__(
@@ -131,9 +132,9 @@ class SwingGroup(BaseGroup):
         large: TimeframeLayer,
         medium: TimeframeLayer,
     ) -> None:
-        assert large.timeframe in LARGE_TIMEFRAMES,  f"large timeframe must be one of {LARGE_TIMEFRAMES}"
+        assert large.timeframe in LARGE_TIMEFRAMES, f"large timeframe must be one of {LARGE_TIMEFRAMES}"
         assert medium.timeframe in MEDIUM_TIMEFRAMES, f"medium timeframe must be one of {MEDIUM_TIMEFRAMES}"
-        self.large  = large
+        self.large = large
         self.medium = medium
 
     @property
@@ -149,13 +150,10 @@ class SwingGroup(BaseGroup):
 
         elif timeframe == self.medium.timeframe:
             medium_result = self.medium.evaluate(data)
-            large_result  = self.large.confirmed_direction
+            large_result = self.large.confirmed_direction
 
-            if (
-                medium_result.confirmed
-                and medium_result.direction == large_result
-            ):
-                return self._build_signal(data, medium_result.direction)
+            if medium_result.confirmed and medium_result.direction == large_result:
+                return self._build_signal(data, medium_result.direction, medium_result.signal)
 
         return []
 
@@ -167,16 +165,15 @@ class SwingGroup(BaseGroup):
         return {
             "trade_type": self.trade_type,
             "layers": {
-                "large":  self.large.to_dict(),
+                "large": self.large.to_dict(),
                 "medium": self.medium.to_dict(),
             },
         }
 
 
 class PositionGroup(BaseGroup):
-    """
-    장타: 큰봉 하나만으로 판단.
-    """
+    """Single large-timeframe group."""
+
     trade_type = "position"
 
     def __init__(self, large: TimeframeLayer) -> None:
@@ -194,7 +191,7 @@ class PositionGroup(BaseGroup):
         if timeframe == self.large.timeframe:
             result = self.large.evaluate(data)
             if result.confirmed:
-                return self._build_signal(data, result.direction)
+                return self._build_signal(data, result.direction, result.signal)
         return []
 
     def reset(self) -> None:
@@ -209,24 +206,8 @@ class PositionGroup(BaseGroup):
         }
 
 
-# ── 그룹 빌더 (프론트엔드 설정 → 그룹 생성) ────────────────────────────────
-
 def build_group(config: dict, strategy_registry: dict[str, type]) -> BaseGroup:
-    """
-    프론트엔드에서 전달한 config dict로 그룹을 생성한다.
-
-    config 형식:
-    {
-        "trade_type": "scalping",
-        "layers": {
-            "large":  {"timeframe": "1d",  "strategies": ["trend_follow", "volume_filter"]},
-            "medium": {"timeframe": "4h",  "strategies": ["macd_cross"]},
-            "small":  {"timeframe": "15m", "strategies": ["rsi_entry", "breakout"]},
-        }
-    }
-
-    strategy_registry: {"strategy_name": StrategyClass, ...}
-    """
+    """Build a group from config."""
 
     def _make_layer(cfg: dict, leverage: int = 1) -> TimeframeLayer:
         strategies = [
@@ -241,18 +222,17 @@ def build_group(config: dict, strategy_registry: dict[str, type]) -> BaseGroup:
 
     if trade_type == "scalping":
         return ScalpingGroup(
-            large  = _make_layer(layers["large"],  leverage),
-            medium = _make_layer(layers["medium"], leverage),
-            small  = _make_layer(layers["small"],  leverage),
+            large=_make_layer(layers["large"], leverage),
+            medium=_make_layer(layers["medium"], leverage),
+            small=_make_layer(layers["small"], leverage),
         )
-    elif trade_type == "swing":
+    if trade_type == "swing":
         return SwingGroup(
-            large  = _make_layer(layers["large"],  leverage),
-            medium = _make_layer(layers["medium"], leverage),
+            large=_make_layer(layers["large"], leverage),
+            medium=_make_layer(layers["medium"], leverage),
         )
-    elif trade_type == "position":
+    if trade_type == "position":
         return PositionGroup(
-            large = _make_layer(layers["large"], leverage),
+            large=_make_layer(layers["large"], leverage),
         )
-    else:
-        raise ValueError(f"Unknown trade_type: {trade_type}")
+    raise ValueError(f"Unknown trade_type: {trade_type}")
