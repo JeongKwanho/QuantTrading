@@ -136,16 +136,15 @@ class FVGChannelV1(BaseStrategy):
         lower = fvg.lower
         upper = fvg.upper
         mid = (lower + upper) / 2
-        lookback = self.parameters["liquidity_lookback"]
         fvg_candles = self._history[-3:]
         prior = self._history[:-3]
+        lookback = self.parameters["liquidity_lookback"]
         prior_window = prior[-lookback:] if lookback > 0 else prior
-        stop_scope = prior_window + fvg_candles
 
         if side == "LONG":
-            sl_price = min(c.low for c in stop_scope)
+            sl_price = min(c.low for c in fvg_candles)
         else:
-            sl_price = max(c.high for c in stop_scope)
+            sl_price = max(c.high for c in fvg_candles)
 
         self._setup = _FVGSetup(
             side=side,
