@@ -13,7 +13,7 @@ TP2    : candle.high >= H2                                         → SELL all 
 포지션 완전 청산 시 채널을 unlock → 다음 채널 탐지 시작.
 """
 
-from patterns.trend_line import TrendChannel, TrendLinePattern
+from detection.trend_line import TrendChannel, TrendLinePattern
 from strategies.base import BaseStrategy, FillEvent, MarketData, Signal
 
 

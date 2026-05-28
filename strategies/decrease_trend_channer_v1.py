@@ -5,7 +5,7 @@ This file starts as a clean copy of TrendChannelV1 so we can improve the idea
 without changing the existing strategy.
 """
 
-from patterns.trend_line import TrendChannel, TrendLinePattern
+from detection.trend_line import TrendChannel, TrendLinePattern
 from strategies.base import BaseStrategy, FillEvent, MarketData, Signal
 
 

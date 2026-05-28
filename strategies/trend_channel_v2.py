@@ -14,7 +14,7 @@ TP2    : candle.low  <= L2 price                                  → BUY all  (
 포지션 완전 청산 시 채널 unlock → 다음 채널 탐지 시작.
 """
 
-from patterns.trend_line import TrendLinePatternUp, TrendChannel
+from detection.trend_line import TrendChannel, TrendLinePatternUp
 from strategies.base import BaseStrategy, FillEvent, MarketData, Signal
 
 

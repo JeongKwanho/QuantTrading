@@ -8,7 +8,7 @@ This is the live-safe version of DecreaseTrendChannerV1 / New+B:
 - Uses close-based exits to avoid OHLC intrabar ordering assumptions.
 """
 
-from patterns.trend_line import TrendChannel, TrendLinePattern
+from detection.trend_line import TrendChannel, TrendLinePattern
 from strategies.base import BaseStrategy, FillEvent, MarketData, Signal
 
 

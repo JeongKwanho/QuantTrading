@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from binance import AsyncClient
 
-from patterns.fair_value_gap import FairValueGapPattern
+from detection.fair_value_gap import FairValueGapPattern
 from strategies.base import MarketData
 
 if sys.platform == "win32":

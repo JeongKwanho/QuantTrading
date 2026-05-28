@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from patterns.fair_value_gap import FairValueGap, FairValueGapPattern
+from detection.fair_value_gap import FairValueGap, FairValueGapPattern
 from strategies.base import BaseStrategy, FillEvent, MarketData, Signal
 
 

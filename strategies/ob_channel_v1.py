@@ -15,7 +15,7 @@ Exit:
 
 from datetime import datetime
 
-from patterns.order_block import OrderBlock, OrderBlockPattern
+from detection.order_block import OrderBlock, OrderBlockPattern
 from strategies.base import BaseStrategy, FillEvent, MarketData, Signal
 
 

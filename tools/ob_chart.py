@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from binance import AsyncClient
 
-from patterns.order_block import OrderBlockPattern
+from detection.order_block import OrderBlockPattern
 from strategies.base import MarketData
 
 if sys.platform == "win32":

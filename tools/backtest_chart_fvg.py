@@ -18,7 +18,7 @@ from binance import AsyncClient
 
 from backend.broker.base import OrderSide, Signal as BrokerSignal
 from broker.mock import MockBroker
-from patterns.fair_value_gap import FairValueGapPattern
+from detection.fair_value_gap import FairValueGapPattern
 from strategies.base import FillEvent, MarketData
 from strategies.fvg_channel_v1 import FVGChannelV1
 
