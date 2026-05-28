@@ -24,9 +24,17 @@ if sys.platform == "win32":
 
 
 SYMBOL = "BTCUSDT"
-TREND_WINDOW = 60
+TREND_WINDOW = 8
 PIVOT_K = 2
-MIN_GAP_PCT = 0.0
+MIN_GAP_SIZE = 0.0
+MIDDLE_RANGE_MULTIPLIER = 1.2
+MIN_GAP_PCT_BY_TF = {
+    "5m": 0.0010,
+    "15m": 0.0012,
+    "1h": 0.0015,
+    "4h": 0.0020,
+    "1d": 0.0030,
+}
 
 INTERVAL_SECONDS = {
     "1d": 86400,
@@ -74,18 +82,19 @@ async def fetch_candles(client, symbol, interval, n):
     return candles[:n]
 
 
-def run_detection(candles: list[dict]) -> tuple[list[dict], list[dict]]:
+def run_detection(candles: list[dict], min_gap_pct: float) -> tuple[list[dict], list[dict]]:
     pattern = FairValueGapPattern(
         trend_window=TREND_WINDOW,
         pivot_k=PIVOT_K,
-        min_gap_pct=MIN_GAP_PCT,
+        min_gap_size=MIN_GAP_SIZE,
+        min_gap_pct=min_gap_pct,
+        middle_range_multiplier=MIDDLE_RANGE_MULTIPLIER,
     )
 
     candle_records: list[dict] = []
     fvg_zones: list[dict] = []
 
     for candle in candles:
-        ts_str = candle["timestamp"].strftime("%Y-%m-%dT%H:%M:%S")
         data = MarketData(
             symbol=SYMBOL,
             timestamp=candle["timestamp"],
@@ -98,7 +107,7 @@ def run_detection(candles: list[dict]) -> tuple[list[dict], list[dict]]:
         pattern.evaluate(data)
 
         candle_records.append({
-            "ts": ts_str,
+            "ts": candle["timestamp"].strftime("%Y-%m-%dT%H:%M:%S"),
             "o": candle["open"],
             "h": candle["high"],
             "l": candle["low"],
@@ -107,7 +116,6 @@ def run_detection(candles: list[dict]) -> tuple[list[dict], list[dict]]:
 
         if pattern.last_fvg is not None:
             fvg = pattern.last_fvg
-            structure = fvg.structure
             fvg_zones.append({
                 "direction": fvg.direction,
                 "trend": fvg.trend,
@@ -118,15 +126,8 @@ def run_detection(candles: list[dict]) -> tuple[list[dict], list[dict]]:
                 "upper": fvg.upper,
                 "gap_size": fvg.gap_size,
                 "gap_pct": fvg.gap_pct,
-                "structure": None if structure is None else {
-                    "trend_h1_ts": structure.trend_h1_timestamp.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "trend_h1_price": structure.trend_h1_price,
-                    "trend_h2_ts": structure.trend_h2_timestamp.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "trend_h2_price": structure.trend_h2_price,
-                    "trend_slope": structure.trend_slope,
-                    "liquidity_ts": structure.liquidity_timestamp.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "liquidity_price": structure.liquidity_price,
-                },
+                "middle_range": fvg.middle_range,
+                "side_range_max": fvg.side_range_max,
             })
 
     return candle_records, fvg_zones
@@ -141,7 +142,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #17181c; color: #e7e9ee; font-family: "Segoe UI", sans-serif; height: 100vh; display: flex; flex-direction: column; }
-#header { padding: 8px 12px; background: #111217; border-bottom: 1px solid #2d3038; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+#header { padding: 8px 12px; background: #111217; border-bottom: 1px solid #2d3038; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 #header h2 { font-size: 13px; color: #e7e9ee; white-space: nowrap; font-weight: 600; }
 .tabs, .filters { display: flex; gap: 4px; flex-wrap: wrap; }
 .tab, .filter { padding: 5px 12px; background: #2d3038; border: none; color: #e7e9ee; cursor: pointer; border-radius: 4px; font-size: 12px; }
@@ -153,11 +154,12 @@ body { background: #17181c; color: #e7e9ee; font-family: "Segoe UI", sans-serif;
 </head>
 <body>
 <div id="header">
-  <h2>BTCUSDT · Bullish FVG Break Detection · trend_window=__TREND_WINDOW__ pivot_k=__PIVOT_K__</h2>
+  <h2>BTCUSDT FVG Detection | TF-specific gap pct | trend=__TREND_WINDOW__ | middle_x=__MIDDLE_RANGE_MULTIPLIER__</h2>
   <div class="tabs" id="tabs"></div>
   <div class="filters">
     <button class="filter active" data-filter="all">All</button>
-    <button class="filter" data-filter="bullish">Bullish in Downtrend</button>
+    <button class="filter" data-filter="bullish">Bullish</button>
+    <button class="filter" data-filter="bearish">Bearish</button>
   </div>
   <div id="stats"></div>
 </div>
@@ -181,8 +183,9 @@ function renderChart(key) {
   document.querySelectorAll('.filter').forEach(t => t.classList.toggle('active', t.dataset.filter === VIEW.filter));
 
   const bullish = d.fvg_zones.filter(z => z.direction === 'bullish').length;
+  const bearish = d.fvg_zones.filter(z => z.direction === 'bearish').length;
   document.getElementById('stats').textContent =
-    `FVG ${d.fvg_zones.length} | bullish break ${bullish} | shown ${zones.length}`;
+    `min_gap_pct ${(d.min_gap_pct * 100).toFixed(2)}% | FVG ${d.fvg_zones.length} | bullish ${bullish} | bearish ${bearish} | shown ${zones.length}`;
 
   const traces = [{
     type: 'candlestick',
@@ -202,8 +205,7 @@ function renderChart(key) {
 
   for (const z of zones) {
     const mid = (z.lower + z.upper) / 2;
-    const liq = z.structure ? `<br>liquidity=${z.structure.liquidity_price.toFixed(2)}` : '';
-    const label = `${z.direction} FVG<br>trend=${z.trend}<br>gap=${z.gap_size.toFixed(2)}<br>gap_pct=${(z.gap_pct * 100).toFixed(3)}%${liq}`;
+    const label = `${z.direction} FVG<br>prior trend=${z.trend}<br>gap=${z.gap_size.toFixed(2)}<br>gap_pct=${(z.gap_pct * 100).toFixed(3)}%<br>middle_range=${z.middle_range.toFixed(2)}<br>side_max=${z.side_range_max.toFixed(2)}`;
     if (z.direction === 'bullish') {
       bx.push(z.ts_mid);
       by.push(mid);
@@ -218,7 +220,7 @@ function renderChart(key) {
   if (bx.length) traces.push({
     type: 'scatter',
     mode: 'markers',
-    name: 'Bullish FVG in Downtrend',
+    name: 'Bullish FVG',
     x: bx,
     y: by,
     text: bText,
@@ -229,7 +231,7 @@ function renderChart(key) {
   if (sx.length) traces.push({
     type: 'scatter',
     mode: 'markers',
-    name: 'Bearish FVG in Uptrend',
+    name: 'Bearish FVG',
     x: sx,
     y: sy,
     text: sText,
@@ -254,30 +256,6 @@ function renderChart(key) {
         width: 1,
       },
     });
-    if (z.structure) {
-      shapes.push({
-        type: 'line',
-        xref: 'x',
-        yref: 'y',
-        x0: z.structure.trend_h1_ts,
-        x1: z.ts_end,
-        y0: z.structure.trend_h1_price,
-        y1: z.structure.trend_h1_price + z.structure.trend_slope * (
-          d.ts.indexOf(z.ts_end) - d.ts.indexOf(z.structure.trend_h1_ts)
-        ),
-        line: { color: 'rgba(245,196,92,0.85)', width: 1.5 },
-      });
-      shapes.push({
-        type: 'line',
-        xref: 'x',
-        yref: 'y',
-        x0: z.structure.liquidity_ts,
-        x1: z.ts_end,
-        y0: z.structure.liquidity_price,
-        y1: z.structure.liquidity_price,
-        line: { color: 'rgba(224,93,93,0.75)', width: 1.2, dash: 'dot' },
-      });
-    }
   }
 
   const xEnd = d.ts[d.ts.length - 1];
@@ -355,11 +333,13 @@ async def main() -> None:
     try:
         for sc in SCENARIOS:
             label, tf, n = sc["label"], sc["tf"], sc["n"]
-            print(f"  [{label}] fetching {n} x {tf} candles ...", end=" ", flush=True)
+            min_gap_pct = MIN_GAP_PCT_BY_TF[tf]
+            print(f"  [{label}] fetching {n} x {tf} candles (min_gap_pct={min_gap_pct:.4f}) ...", end=" ", flush=True)
             candles = await fetch_candles(client, SYMBOL, tf, n)
-            records, fvg_zones = run_detection(candles)
+            records, fvg_zones = run_detection(candles, min_gap_pct)
             bullish = len([z for z in fvg_zones if z["direction"] == "bullish"])
-            print(f"{len(candles)} candles | bullish break FVG {bullish}")
+            bearish = len([z for z in fvg_zones if z["direction"] == "bearish"])
+            print(f"{len(candles)} candles | bullish {bullish} | bearish {bearish}")
             all_data[label] = {
                 "ts": [r["ts"] for r in records],
                 "o": [r["o"] for r in records],
@@ -367,6 +347,7 @@ async def main() -> None:
                 "l": [r["l"] for r in records],
                 "c": [r["c"] for r in records],
                 "fvg_zones": fvg_zones,
+                "min_gap_pct": min_gap_pct,
             }
     finally:
         await client.close_connection()
@@ -375,7 +356,7 @@ async def main() -> None:
         HTML_TEMPLATE
         .replace("__ALL_DATA__", json.dumps(all_data, ensure_ascii=False, separators=(",", ":")))
         .replace("__TREND_WINDOW__", str(TREND_WINDOW))
-        .replace("__PIVOT_K__", str(PIVOT_K))
+        .replace("__MIDDLE_RANGE_MULTIPLIER__", str(MIDDLE_RANGE_MULTIPLIER))
     )
 
     out = Path(__file__).parent / "fvg_result.html"
