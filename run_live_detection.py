@@ -2,8 +2,8 @@
 Live combined-detection monitor.
 
 Watches selected Binance futures symbols/timeframes, stores closed candles and
-detection snapshots in SQLite, and records an event when the rolling 15-candle
-combined detection changes from 0 to 1.
+detection snapshots in SQLite, and records an event when a spatially-related
+observation setup changes from 0 to 1.
 
 Run:
     python run_live_detection.py
@@ -133,6 +133,10 @@ class DetectionDatabase:
                 fvg_current INTEGER NOT NULL,
                 fvg_bars_since INTEGER,
                 fvg_direction TEXT,
+                relationship_state INTEGER NOT NULL DEFAULT 0,
+                relationship_direction TEXT,
+                relationship_score INTEGER NOT NULL DEFAULT 0,
+                relationship_details_json TEXT NOT NULL DEFAULT '{}',
                 details_json TEXT NOT NULL,
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -146,6 +150,8 @@ class DetectionDatabase:
                 close_time TEXT NOT NULL,
                 detected_count INTEGER NOT NULL,
                 detected_names TEXT NOT NULL,
+                relationship_direction TEXT,
+                relationship_score INTEGER NOT NULL DEFAULT 0,
                 details_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -156,7 +162,18 @@ class DetectionDatabase:
                 ON detection_snapshots (all_three_detected, close_time);
             """
         )
+        self._ensure_column("detection_snapshots", "relationship_state", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("detection_snapshots", "relationship_direction", "TEXT")
+        self._ensure_column("detection_snapshots", "relationship_score", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("detection_snapshots", "relationship_details_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("detection_events", "relationship_direction", "TEXT")
+        self._ensure_column("detection_events", "relationship_score", "INTEGER NOT NULL DEFAULT 0")
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def save_candle(
         self,
@@ -208,8 +225,10 @@ class DetectionDatabase:
                 trend_detected, trend_current, trend_bars_since, trend_direction,
                 ob_detected, ob_current, ob_bars_since, ob_direction,
                 fvg_detected, fvg_current, fvg_bars_since, fvg_direction,
+                relationship_state, relationship_direction, relationship_score,
+                relationship_details_json,
                 details_json, source, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
@@ -232,6 +251,10 @@ class DetectionDatabase:
                 int(fvg.currently_detected),
                 fvg.bars_since_detected,
                 fvg.direction,
+                int(snapshot.relationship_state),
+                snapshot.relationship.direction,
+                snapshot.relationship.score,
+                _json_dumps(asdict(snapshot.relationship)),
                 _json_dumps(asdict(snapshot)),
                 source,
                 datetime.utcnow().isoformat(sep=" "),
@@ -249,8 +272,9 @@ class DetectionDatabase:
             """
             INSERT INTO detection_events (
                 symbol, interval, close_time, detected_count,
-                detected_names, details_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                detected_names, relationship_direction, relationship_score,
+                details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
@@ -258,6 +282,8 @@ class DetectionDatabase:
                 close_time.isoformat(sep=" "),
                 snapshot.detected_count,
                 ",".join(snapshot.detected_names()),
+                snapshot.relationship.direction,
+                snapshot.relationship.score,
                 _json_dumps(asdict(snapshot)),
                 datetime.utcnow().isoformat(sep=" "),
             ),
@@ -324,6 +350,12 @@ def _format_item_age(snapshot: DetectionSnapshot) -> str:
     return " ".join(parts)
 
 
+def _format_relationship(snapshot: DetectionSnapshot) -> str:
+    relationship = snapshot.relationship
+    direction = relationship.direction or "-"
+    return f"rel={int(relationship.state)} direction={direction} score={relationship.score}"
+
+
 async def warmup(
     client: AsyncClient,
     db: DetectionDatabase,
@@ -347,7 +379,7 @@ async def warmup(
                 db.save_snapshot(symbol, interval, close_time, snapshot, "warmup")
 
             last_snapshot = snapshot if closed else None
-            last_state[key] = bool(last_snapshot and last_snapshot.all_three_detected)
+            last_state[key] = bool(last_snapshot and last_snapshot.relationship_state)
             db.commit()
             state = "1" if last_state[key] else "0"
             log_info(f"[warmup] {symbol:<8} {interval:<3} candles={len(closed):>3} state={state}")
@@ -390,7 +422,7 @@ async def run_stream_once(db: DetectionDatabase) -> None:
                 open_time, close_time, data = _market_data_from_ws(symbol, candle)
                 snapshot = judges[key].evaluate(data)
                 was_one = last_state[key]
-                is_one = snapshot.all_three_detected
+                is_one = snapshot.relationship_state
 
                 db.save_candle(symbol, interval, open_time, close_time, data, "live")
                 db.save_snapshot(symbol, interval, close_time, snapshot, "live")
@@ -399,6 +431,7 @@ async def run_stream_once(db: DetectionDatabase) -> None:
                     log_info(
                         f"[DETECTED=1] {close_time:%Y-%m-%d %H:%M:%S} "
                         f"{symbol:<8} {interval:<3} close={data.close:.8g} "
+                        f"{_format_relationship(snapshot)} "
                         f"{_format_item_age(snapshot)}"
                     )
                 else:
@@ -406,6 +439,7 @@ async def run_stream_once(db: DetectionDatabase) -> None:
                         f"[live] {close_time:%Y-%m-%d %H:%M:%S} "
                         f"{symbol:<8} {interval:<3} state={int(is_one)} "
                         f"count={snapshot.detected_count} close={data.close:.8g} "
+                        f"{_format_relationship(snapshot)} "
                         f"{_format_item_age(snapshot)}"
                     )
 
